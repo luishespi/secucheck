@@ -2,12 +2,13 @@ import streamlit as st
 import requests
 from fpdf import FPDF
 
-# ---- Configuración de página ----
+# =========================
+#  Config & constants
+# =========================
 st.set_page_config(page_title="SecuCheck", page_icon="🔒")
-st.title("🔒 SecuCheck - Website Security Scanner")
-st.write("Audit your website security in 60 seconds.")
+st.title("🔒 SecuCheck — Website Security Scanner")
+st.write("Audit your website security in 60 seconds. Get a grade, WAF detection, and a PDF with findings & recommendations.")
 
-# ---- Funciones ----
 SEC_HEADERS = [
     "Strict-Transport-Security",
     "Content-Security-Policy",
@@ -16,84 +17,253 @@ SEC_HEADERS = [
     "Referrer-Policy",
 ]
 
+WAF_SIGNATURES = {
+    "Cloudflare": ["cf-ray", "cf-cache-status", "server: cloudflare", "cf-"],
+    "Akamai": ["akamai", "ghost", "akamai-"],
+    "Imperva": ["incapsula", "x-iinfo"],
+    "AWS (ALB/ELB/WAF)": ["awsalb", "awselb"],
+    "Fastly": ["fastly"],
+    "Sucuri": ["x-sucuri-id", "sucuri"],
+    "F5": ["bigip", "x-waf-event"]
+}
+
+# =========================
+#  Utils
+# =========================
+def normalize_to_url(domain_or_url: str) -> str:
+    dom = domain_or_url.strip()
+    if not dom.startswith(("http://", "https://")):
+        return f"https://{dom}"
+    return dom
+
+def safe_get(url: str):
+    """Single place to GET with sane defaults."""
+    return requests.get(url, timeout=12, allow_redirects=True)
+
+# =========================
+#  Checks
+# =========================
 def check_headers(url: str) -> dict:
     out = {}
     try:
-        r = requests.get(url, timeout=12, allow_redirects=True)
+        r = safe_get(url)
         for h in SEC_HEADERS:
             out[h] = r.headers.get(h, "❌ Missing")
+        # Helpful extras
         out["Status Code"] = r.status_code
         out["Final URL"] = r.url
         out["Server"] = r.headers.get("Server", "Unknown")
+        out["_raw_headers"] = {k.lower(): v for k, v in r.headers.items()}
     except Exception as e:
         out["Error"] = f"{type(e).__name__}: {e}"
+        out["_raw_headers"] = {}
     return out
 
+def detect_waf(headers_dict: dict) -> str:
+    raw = " ".join([f"{k}: {v}" for k, v in headers_dict.items()]).lower()
+    for waf, signs in WAF_SIGNATURES.items():
+        for sig in signs:
+            if sig.lower() in raw:
+                return waf
+    return "❌ None detected"
+
 def simple_tls_info(url: str) -> dict:
+    """
+    Cloud-safe TLS check: no raw sockets (compatible with Streamlit Cloud).
+    Confirm HTTPS usage and basic info.
+    """
     try:
-        r = requests.get(url, timeout=12, allow_redirects=True)
+        r = safe_get(url)
         return {
             "HTTPS used": "✅ Yes" if r.url.startswith("https://") else "❌ No",
-            "Certificate": "N/A (Cloud-safe check)",
+            "Certificate": "N/A (Cloud-safe check)"
         }
     except Exception as e:
         return {"TLS Error": f"{type(e).__name__}: {e}"}
 
+def calculate_score(headers: dict, tls_info: dict, waf_name: str):
+    """
+    Score (0-100) + Grade A–F.
+    Rules (simple but efectivas para awareness):
+    - Falta de headers críticos: -10 c/u
+    - Sin WAF: -15
+    - Sin HTTPS: -30
+    """
+    score = 100
+
+    # Penaliza headers faltantes
+    missing = [k for k in SEC_HEADERS if "Missing" in str(headers.get(k, ""))]
+    score -= 10 * len(missing)
+
+    # Penaliza no tener WAF
+    if waf_name == "❌ None detected":
+        score -= 15
+
+    # Penaliza no usar HTTPS
+    if tls_info.get("HTTPS used") == "❌ No":
+        score -= 30
+
+    # Limita score
+    score = max(0, min(100, score))
+
+    # Grade
+    if score > 90:
+        grade = "A"
+    elif score > 75:
+        grade = "B"
+    elif score > 60:
+        grade = "C"
+    elif score > 45:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return grade, score, missing
+
+def recommendations(headers: dict, tls_info: dict, waf_name: str):
+    recs = []
+
+    if waf_name == "❌ None detected":
+        recs.append("Implement a Web Application Firewall (e.g., Cloudflare WAF) to mitigate L7 threats.")
+
+    if "Missing" in str(headers.get("Content-Security-Policy", "")):
+        recs.append("Add a strong Content-Security-Policy to reduce XSS attack surface.")
+
+    if "Missing" in str(headers.get("Strict-Transport-Security", "")):
+        recs.append("Enable HSTS (Strict-Transport-Security) with preload for HTTPS enforcement.")
+
+    if "Missing" in str(headers.get("X-Frame-Options", "")):
+        recs.append("Set X-Frame-Options (DENY or SAMEORIGIN) to mitigate clickjacking.")
+
+    if "Missing" in str(headers.get("X-Content-Type-Options", "")):
+        recs.append("Set X-Content-Type-Options: nosniff to prevent MIME-type sniffing.")
+
+    if "Missing" in str(headers.get("Referrer-Policy", "")):
+        recs.append("Set Referrer-Policy to limit referrer leakage (e.g., no-referrer-when-downgrade).")
+
+    if tls_info.get("HTTPS used") == "❌ No":
+        recs.append("Enable HTTPS with a valid TLS certificate (Let's Encrypt or provider).")
+
+    return recs
+
+def risk_text(grade: str) -> str:
+    return "🚨 High Risk: Immediate remediation recommended." if grade in ["D", "F"] else \
+           "⚠️ Medium Risk: Improvements advised." if grade == "C" else \
+           "✅ Good protection level."
+
+# =========================
+#  PDF (latin-1 safe)
+# =========================
 class PDF(FPDF):
     def write_text(self, text):
-        # Evita errores de codificación reemplazando caracteres fuera de latin-1
-        safe_text = text.encode("latin-1", "replace").decode("latin-1")
-        self.multi_cell(0, 7, safe_text)
+        safe = text.encode("latin-1", "replace").decode("latin-1")
+        self.multi_cell(0, 7, safe)
 
-def generate_report(domain: str, headers: dict, tls: dict) -> str:
+def generate_pdf(domain: str, headers: dict, tls: dict, waf_name: str, grade: str, score: int, missing: list, recs: list) -> str:
     pdf = PDF()
     pdf.add_page()
-    pdf.set_font("Arial", size=14)
-    pdf.cell(0, 10, f"Security Audit Report for {domain}", ln=True, align="C")
-    pdf.ln(8)
+    pdf.set_font("Arial", size=16)
+    pdf.cell(0, 10, "SecuCheck — Security Audit Report", ln=True, align="C")
+
+    pdf.set_font("Arial", size=12)
+    pdf.write_text(f"Domain: {domain}")
+    pdf.write_text(f"Final URL: {headers.get('Final URL', 'N/A')}")
+    pdf.ln(2)
+    pdf.write_text(f"Security Grade: {grade} ({score}%)")
+    pdf.write_text(f"WAF Detected: {waf_name}")
+    pdf.write_text(f"Risk: {risk_text(grade)}")
+    pdf.ln(5)
 
     pdf.set_font("Arial", size=12)
     pdf.write_text("HTTP Security Headers:")
-    pdf.ln(5)
-    for k, v in headers.items():
-        pdf.write_text(f"{k}: {v}")
-    pdf.ln(5)
+    for k in SEC_HEADERS:
+        pdf.write_text(f" - {k}: {headers.get(k, 'N/A')}")
+
+    pdf.ln(2)
     pdf.write_text("TLS / HTTPS Information:")
     for k, v in tls.items():
-        pdf.write_text(f"{k}: {v}")
+        pdf.write_text(f" - {k}: {v}")
 
-    filename = f"{domain}_report.pdf"
-    pdf.output(filename)
-    return filename
+    if missing:
+        pdf.ln(2)
+        pdf.write_text("Missing headers:")
+        for m in missing:
+            pdf.write_text(f" - {m}")
 
-# ---- Interfaz ----
+    if recs:
+        pdf.ln(3)
+        pdf.write_text("Recommendations:")
+        for r in recs:
+            pdf.write_text(f" - {r}")
+
+    pdf.ln(3)
+    pdf.write_text("This automated report is informational and not a full penetration test.")
+
+    fname = f"{domain.replace('https://','').replace('http://','').strip('/')}_report.pdf"
+    pdf.output(fname)
+    return fname
+
+# =========================
+#  UI
+# =========================
 with st.form("secucheck_form", clear_on_submit=False):
-    domain = st.text_input("Enter a domain (example.com):", value="")
+    domain_input = st.text_input("Enter a domain (example.com):", value="")
     submitted = st.form_submit_button("Scan now")
 
 if submitted:
-    if not domain.strip():
+    if not domain_input.strip():
         st.warning("Please enter a domain first.")
     else:
-        if not domain.startswith("http://") and not domain.startswith("https://"):
-            url = f"https://{domain.strip()}"
-        else:
-            url = domain.strip()
-
+        url = normalize_to_url(domain_input)
         st.info("🔍 Scanning in progress...")
+
         headers = check_headers(url)
         tls = simple_tls_info(url)
-        report_path = generate_report(domain, headers, tls)
+        waf = detect_waf(headers.get("_raw_headers", {}))
+        grade, score, missing = calculate_score(headers, tls, waf)
+        recs = recommendations(headers, tls, waf)
+
         st.success("✅ Scan complete!")
 
-        st.subheader("Results (preview)")
-        st.json({"headers": headers, "tls": tls})
+        # Dashboard técnico
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Security Grade", f"{grade}", f"{score}%")
+        with c2:
+            st.metric("WAF", waf)
+        with c3:
+            st.metric("Status Code", headers.get("Status Code", "N/A"))
 
-        with open(report_path, "rb") as f:
+        st.markdown(f"**Risk:** {risk_text(grade)}")
+
+        with st.expander("HTTP headers"):
+            st.json({k: headers.get(k) for k in SEC_HEADERS})
+        with st.expander("TLS / HTTPS"):
+            st.json(tls)
+
+        st.subheader("🔧 Recommendations")
+        if recs:
+            for r in recs:
+                st.markdown(f"- {r}")
+        else:
+            st.markdown("- No critical gaps detected. Keep monitoring and hardening.")
+
+        # PDF
+        pdf_path = generate_pdf(
+            domain=domain_input,
+            headers=headers,
+            tls=tls,
+            waf_name=waf,
+            grade=grade,
+            score=score,
+            missing=missing,
+            recs=recs
+        )
+        with open(pdf_path, "rb") as f:
             st.download_button(
                 label="Download PDF Report",
                 data=f,
-                file_name=report_path,
+                file_name=pdf_path,
                 mime="application/pdf",
             )
 
