@@ -6,8 +6,8 @@ from fpdf import FPDF, HTMLMixin
 #  Configuración inicial
 # =========================
 st.set_page_config(page_title="SecuCheck", page_icon="🔒")
-st.title("🔒 SecuCheck — Website Security Scanner")
-st.write("Audit your website security in 60 seconds. Get a grade, WAF detection, and a PDF with findings & recommendations.")
+st.title("🔒 SecuCheck — Executive Web Security Audit")
+st.write("Audit public endpoints in 60 seconds. Ideal for CISO/CIO awareness reports and external exposure assessments.")
 
 # =========================
 #  Constantes y firmas
@@ -31,7 +31,7 @@ WAF_SIGNATURES = {
 }
 
 # =========================
-#  Funciones utilitarias
+#  Funciones base
 # =========================
 def normalize_to_url(domain_or_url: str) -> str:
     dom = domain_or_url.strip()
@@ -40,11 +40,10 @@ def normalize_to_url(domain_or_url: str) -> str:
     return dom
 
 def safe_get(url: str):
-    """Hace GET con tiempo de espera controlado."""
-    return requests.get(url, timeout=12, allow_redirects=True)
+    return requests.get(url, timeout=10, allow_redirects=True)
 
 # =========================
-#  Módulos de análisis
+#  Escaneos
 # =========================
 def check_headers(url: str) -> dict:
     out = {}
@@ -56,188 +55,150 @@ def check_headers(url: str) -> dict:
         out["Final URL"] = r.url
         out["Server"] = r.headers.get("Server", "Unknown")
         out["_raw_headers"] = {k.lower(): v for k, v in r.headers.items()}
+        out["_cookies"] = r.headers.get("Set-Cookie", "")
     except Exception as e:
-        out["Error"] = f"{type(e).__name__}: {e}"
+        out["Error"] = str(e)
         out["_raw_headers"] = {}
     return out
 
 def detect_waf(headers_dict: dict) -> str:
     raw = " ".join([f"{k}: {v}" for k, v in headers_dict.items()]).lower()
     for waf, signs in WAF_SIGNATURES.items():
-        for sig in signs:
-            if sig.lower() in raw:
-                return waf
+        if any(sig.lower() in raw for sig in signs):
+            return waf
     return "❌ None detected"
 
 def simple_tls_info(url: str) -> dict:
-    """Check seguro de HTTPS sin sockets crudos."""
     try:
         r = safe_get(url)
-        return {
-            "HTTPS used": "✅ Yes" if r.url.startswith("https://") else "❌ No",
-            "Certificate": "N/A (Cloud-safe check)"
-        }
+        return {"HTTPS used": "✅ Yes" if r.url.startswith("https://") else "❌ No"}
     except Exception as e:
-        return {"TLS Error": f"{type(e).__name__}: {e}"}
+        return {"TLS Error": str(e)}
 
-def calculate_score(headers: dict, tls_info: dict, waf_name: str):
-    score = 100
-    missing = [k for k in SEC_HEADERS if "Missing" in str(headers.get(k, ""))]
+def analyze_cookies(cookie_str: str) -> dict:
+    if not cookie_str:
+        return {"Cookies found": "❌ None"}
+    flags = {"Secure": "❌ Missing", "HttpOnly": "❌ Missing", "SameSite": "❌ Missing"}
+    if "secure" in cookie_str.lower():
+        flags["Secure"] = "✅ Present"
+    if "httponly" in cookie_str.lower():
+        flags["HttpOnly"] = "✅ Present"
+    if "samesite" in cookie_str.lower():
+        flags["SameSite"] = "✅ Present"
+    return flags
 
-    score -= 10 * len(missing)
-    if waf_name == "❌ None detected":
-        score -= 15
-    if tls_info.get("HTTPS used") == "❌ No":
-        score -= 30
+def detect_tech_exposure(headers: dict) -> list:
+    exposure = []
+    if headers.get("Server") and headers["Server"] not in ["Unknown", ""]:
+        exposure.append(f"Server header reveals: {headers['Server']}")
+    raw = " ".join(headers.get("_raw_headers", {}).keys())
+    if "x-powered-by" in raw:
+        exposure.append("X-Powered-By header exposes backend technology.")
+    return exposure
 
-    score = max(0, min(100, score))
-    grade = (
-        "A" if score > 90 else
-        "B" if score > 75 else
-        "C" if score > 60 else
-        "D" if score > 45 else
-        "F"
-    )
-    return grade, score, missing
-
-def recommendations(headers: dict, tls_info: dict, waf_name: str):
-    recs = []
-    if waf_name == "❌ None detected":
-        recs.append("Implement a Web Application Firewall (e.g., Cloudflare WAF) to mitigate L7 threats.")
-    if "Missing" in str(headers.get("Content-Security-Policy", "")):
-        recs.append("Add a strong Content-Security-Policy to reduce XSS attack surface.")
-    if "Missing" in str(headers.get("Strict-Transport-Security", "")):
-        recs.append("Enable HSTS (Strict-Transport-Security) with preload for HTTPS enforcement.")
-    if "Missing" in str(headers.get("X-Frame-Options", "")):
-        recs.append("Set X-Frame-Options (DENY or SAMEORIGIN) to mitigate clickjacking.")
-    if "Missing" in str(headers.get("X-Content-Type-Options", "")):
-        recs.append("Set X-Content-Type-Options: nosniff to prevent MIME-type sniffing.")
-    if "Missing" in str(headers.get("Referrer-Policy", "")):
-        recs.append("Set Referrer-Policy to limit referrer leakage (e.g., no-referrer-when-downgrade).")
-    if tls_info.get("HTTPS used") == "❌ No":
-        recs.append("Enable HTTPS with a valid TLS certificate (Let's Encrypt or provider).")
-    return recs
-
-def risk_text(grade: str) -> str:
-    return (
-        "🚨 High Risk: Immediate remediation recommended."
-        if grade in ["D", "F"]
-        else "⚠️ Medium Risk: Improvements advised."
-        if grade == "C"
-        else "✅ Good protection level."
-    )
+def risk_text(grade: str):
+    return "🚨 High Risk" if grade in ["D", "F"] else "⚠️ Medium Risk" if grade == "C" else "✅ Good"
 
 # =========================
-#  PDF (UTF-8 seguro con fpdf2)
+#  PDF (fpdf2)
 # =========================
 class PDF(FPDF, HTMLMixin):
-    def write_text(self, text):
-        self.multi_cell(0, 7, text)
+    pass
 
-def generate_pdf(domain: str, headers: dict, tls: dict, waf_name: str, grade: str, score: int, missing: list, recs: list) -> str:
+def generate_pdf(domain, headers, tls, waf, grade, score, cookies, exposure, recs):
     pdf = PDF()
     pdf.add_page()
     pdf.set_font("Helvetica", size=16)
-    pdf.cell(0, 10, "SecuCheck — Security Audit Report", ln=True, align="C")
+    pdf.cell(0, 10, "SecuCheck — Executive Security Report", ln=True, align="C")
 
     pdf.set_font("Helvetica", size=12)
-    pdf.write_text(f"Domain: {domain}")
-    pdf.write_text(f"Final URL: {headers.get('Final URL', 'N/A')}")
-    pdf.ln(2)
-    pdf.write_text(f"Security Grade: {grade} ({score}%)")
-    pdf.write_text(f"WAF Detected: {waf_name}")
-    pdf.write_text(f"Risk: {risk_text(grade)}")
+    pdf.multi_cell(0, 8, f"Domain: {domain}")
+    pdf.multi_cell(0, 8, f"Final URL: {headers.get('Final URL','N/A')}")
+    pdf.multi_cell(0, 8, f"Grade: {grade} ({score}%) — {risk_text(grade)}")
+    pdf.multi_cell(0, 8, f"WAF Detected: {waf}")
     pdf.ln(5)
 
-    pdf.write_text("HTTP Security Headers:")
+    pdf.multi_cell(0, 8, "HTTP Security Headers:")
     for k in SEC_HEADERS:
-        pdf.write_text(f" - {k}: {headers.get(k, 'N/A')}")
+        pdf.multi_cell(0, 8, f" - {k}: {headers.get(k, 'N/A')}")
 
-    pdf.ln(2)
-    pdf.write_text("TLS / HTTPS Information:")
-    for k, v in tls.items():
-        pdf.write_text(f" - {k}: {v}")
+    pdf.ln(4)
+    pdf.multi_cell(0, 8, "Cookie Security Flags:")
+    for k, v in cookies.items():
+        pdf.multi_cell(0, 8, f" - {k}: {v}")
 
-    if missing:
-        pdf.ln(2)
-        pdf.write_text("Missing headers:")
-        for m in missing:
-            pdf.write_text(f" - {m}")
+    if exposure:
+        pdf.ln(4)
+        pdf.multi_cell(0, 8, "Technology Exposure:")
+        for e in exposure:
+            pdf.multi_cell(0, 8, f" - {e}")
 
-    if recs:
-        pdf.ln(3)
-        pdf.write_text("Recommendations:")
-        for r in recs:
-            pdf.write_text(f" - {r}")
+    pdf.ln(5)
+    pdf.multi_cell(0, 8, "Recommendations:")
+    for r in recs:
+        pdf.multi_cell(0, 8, f" - {r}")
 
-    pdf.ln(3)
-    pdf.write_text("This automated report is informational and not a full penetration test.")
+    pdf.ln(6)
+    pdf.multi_cell(0, 8, "Executive Summary:")
+    pdf.multi_cell(0, 8,
+        "This external review identifies missing application security headers, "
+        "unsecured cookies, and exposed technologies that may increase your attack surface. "
+        "Mitigation through WAF, strict HTTPS enforcement, and security headers is recommended."
+    )
+
     fname = f"{domain.replace('https://','').replace('http://','').strip('/')}_report.pdf"
     pdf.output(fname)
     return fname
 
 # =========================
-#  Interfaz principal (UI)
+#  Interfaz
 # =========================
-with st.form("secucheck_form", clear_on_submit=False):
-    domain_input = st.text_input("Enter a domain (example.com):", value="")
-    submitted = st.form_submit_button("Scan now")
+with st.form("scan"):
+    dom = st.text_input("Enter a domain:", value="")
+    submit = st.form_submit_button("Run Executive Audit")
 
-if submitted:
-    if not domain_input.strip():
-        st.warning("Please enter a domain first.")
+if submit:
+    if not dom:
+        st.warning("Enter a valid domain.")
     else:
-        url = normalize_to_url(domain_input)
+        url = normalize_to_url(dom)
         st.info("🔍 Scanning in progress...")
 
         headers = check_headers(url)
-        tls = simple_tls_info(url)
         waf = detect_waf(headers.get("_raw_headers", {}))
-        grade, score, missing = calculate_score(headers, tls, waf)
-        recs = recommendations(headers, tls, waf)
+        tls = simple_tls_info(url)
+        cookies = analyze_cookies(headers.get("_cookies", ""))
+        exposure = detect_tech_exposure(headers)
 
-        st.success("✅ Scan complete!")
+        missing = [h for h in SEC_HEADERS if "Missing" in str(headers.get(h,""))]
+        score = 100 - (len(missing)*10)
+        if waf == "❌ None detected":
+            score -= 10
+        if cookies.get("Secure") == "❌ Missing":
+            score -= 10
+        grade = "A" if score>90 else "B" if score>75 else "C" if score>60 else "D" if score>45 else "F"
 
-        # Dashboard resumen
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Security Grade", f"{grade}", f"{score}%")
-        with c2:
-            st.metric("WAF", waf)
-        with c3:
-            st.metric("Status Code", headers.get("Status Code", "N/A"))
+        recs = []
+        if missing: recs.append("Implement missing security headers.")
+        if waf == "❌ None detected": recs.append("Deploy a WAF or application firewall.")
+        if "❌ Missing" in cookies.values(): recs.append("Harden cookies with Secure, HttpOnly, SameSite flags.")
+        if exposure: recs.append("Remove Server/X-Powered-By headers to reduce fingerprinting.")
+        if tls.get("HTTPS used") == "❌ No": recs.append("Enable HTTPS with HSTS enforcement.")
 
-        st.markdown(f"**Risk:** {risk_text(grade)}")
+        st.success("✅ Audit complete.")
+        st.metric("Security Grade", f"{grade}", f"{score}%")
+        st.metric("WAF", waf)
+        st.metric("Cookies", cookies.get("Secure","N/A"))
 
-        with st.expander("HTTP headers"):
-            st.json({k: headers.get(k) for k in SEC_HEADERS})
-        with st.expander("TLS / HTTPS"):
-            st.json(tls)
+        with st.expander("HTTP Headers"):
+            st.json(headers)
+        with st.expander("Cookies"):
+            st.json(cookies)
+        with st.expander("Technology Exposure"):
+            st.json(exposure)
 
-        st.subheader("🔧 Recommendations")
-        if recs:
-            for r in recs:
-                st.markdown(f"- {r}")
-        else:
-            st.markdown("- No critical gaps detected. Keep monitoring and hardening.")
-
-        # Generar PDF
-        pdf_path = generate_pdf(
-            domain=domain_input,
-            headers=headers,
-            tls=tls,
-            waf_name=waf,
-            grade=grade,
-            score=score,
-            missing=missing,
-            recs=recs
-        )
+        pdf_path = generate_pdf(dom, headers, tls, waf, grade, score, cookies, exposure, recs)
         with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="Download PDF Report",
-                data=f,
-                file_name=pdf_path,
-                mime="application/pdf",
-            )
+            st.download_button("📄 Download Executive PDF", f, file_name=pdf_path)
 
-st.caption("Powered by The Cloud Defender © 2025")
+st.caption("The Cloud Defender — External Exposure Awareness Tool © 2025")
