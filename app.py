@@ -2,12 +2,12 @@ import streamlit as st
 import requests
 from fpdf import FPDF
 
-# ---- Config básica de página ----
+# ---- Configuración de página ----
 st.set_page_config(page_title="SecuCheck", page_icon="🔒")
 st.title("🔒 SecuCheck - Website Security Scanner")
 st.write("Audit your website security in 60 seconds.")
 
-# ---- Funciones de escaneo ----
+# ---- Funciones ----
 SEC_HEADERS = [
     "Strict-Transport-Security",
     "Content-Security-Policy",
@@ -19,11 +19,9 @@ SEC_HEADERS = [
 def check_headers(url: str) -> dict:
     out = {}
     try:
-        # Forzamos follow redirects para sitios que mueven a https o www
         r = requests.get(url, timeout=12, allow_redirects=True)
         for h in SEC_HEADERS:
             out[h] = r.headers.get(h, "❌ Missing")
-        # info extra útil
         out["Status Code"] = r.status_code
         out["Final URL"] = r.url
         out["Server"] = r.headers.get("Server", "Unknown")
@@ -32,62 +30,60 @@ def check_headers(url: str) -> dict:
     return out
 
 def simple_tls_info(url: str) -> dict:
-    """
-    Método compatible con Streamlit Cloud: NO abre sockets.
-    Toma info básica del certificado si requests la expone y
-    afirma si la conexión fue HTTPS.
-    """
     try:
         r = requests.get(url, timeout=12, allow_redirects=True)
-        tls = {
+        return {
             "HTTPS used": "✅ Yes" if r.url.startswith("https://") else "❌ No",
-            "Peer cert (raw)": "N/A (cloud-safe check)",
+            "Certificate": "N/A (Cloud-safe check)",
         }
-        return tls
     except Exception as e:
         return {"TLS Error": f"{type(e).__name__}: {e}"}
 
+class PDF(FPDF):
+    def write_text(self, text):
+        # Evita errores de codificación reemplazando caracteres fuera de latin-1
+        safe_text = text.encode("latin-1", "replace").decode("latin-1")
+        self.multi_cell(0, 7, safe_text)
+
 def generate_report(domain: str, headers: dict, tls: dict) -> str:
-    pdf = FPDF()
+    pdf = PDF()
     pdf.add_page()
     pdf.set_font("Arial", size=14)
     pdf.cell(0, 10, f"Security Audit Report for {domain}", ln=True, align="C")
+    pdf.ln(8)
+
+    pdf.set_font("Arial", size=12)
+    pdf.write_text("HTTP Security Headers:")
     pdf.ln(5)
-
-    pdf.set_font("Arial", size=12, style="")
-    pdf.cell(0, 8, "HTTP Security Headers", ln=True)
     for k, v in headers.items():
-        pdf.multi_cell(0, 7, f"{k}: {v}")
-
-    pdf.ln(3)
-    pdf.cell(0, 8, "TLS / HTTPS Information", ln=True)
+        pdf.write_text(f"{k}: {v}")
+    pdf.ln(5)
+    pdf.write_text("TLS / HTTPS Information:")
     for k, v in tls.items():
-        pdf.multi_cell(0, 7, f"{k}: {v}")
+        pdf.write_text(f"{k}: {v}")
 
-    fname = f"{domain}_report.pdf"
-    pdf.output(fname)
-    return fname
+    filename = f"{domain}_report.pdf"
+    pdf.output(filename)
+    return filename
 
-# ---- UI (aseguramos el botón con un form) ----
+# ---- Interfaz ----
 with st.form("secucheck_form", clear_on_submit=False):
     domain = st.text_input("Enter a domain (example.com):", value="")
-    submitted = st.form_submit_button("Scan now")  # <--- AQUÍ ESTÁ EL BOTÓN
+    submitted = st.form_submit_button("Scan now")
 
 if submitted:
     if not domain.strip():
         st.warning("Please enter a domain first.")
     else:
-        # Normalizamos el input a URL completa
-        dom = domain.strip()
-        if not dom.startswith("http://") and not dom.startswith("https://"):
-            url = f"https://{dom}"
+        if not domain.startswith("http://") and not domain.startswith("https://"):
+            url = f"https://{domain.strip()}"
         else:
-            url = dom
+            url = domain.strip()
 
         st.info("🔍 Scanning in progress...")
         headers = check_headers(url)
         tls = simple_tls_info(url)
-        report_path = generate_report(domain=dom, headers=headers, tls=tls)
+        report_path = generate_report(domain, headers, tls)
         st.success("✅ Scan complete!")
 
         st.subheader("Results (preview)")
@@ -101,5 +97,4 @@ if submitted:
                 mime="application/pdf",
             )
 
-# Footer
 st.caption("Powered by SecuCheck © 2025")
