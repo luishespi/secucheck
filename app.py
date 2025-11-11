@@ -1,4 +1,4 @@
-# app.py — SecuCheck (Full Passive + Subdomain & Email Discovery)
+# app.py — SecuCheck (Complete Passive Exposure Intelligence)
 # Requisitos: streamlit, requests, fpdf2, dnspython, beautifulsoup4, tldextract
 
 import os
@@ -15,14 +15,14 @@ import streamlit as st
 from time import sleep
 
 # -----------------------
-# Página / Config
+# Page / Config
 # -----------------------
 st.set_page_config(page_title="SecuCheck — Exposure Intelligence", page_icon="🔎", layout="wide")
 st.title("🔎 SecuCheck — External Exposure & Intelligence (Passive)")
 st.write("Passive discovery: DNS, subdomains, exposed emails, IPs, quick port handshakes, API probes, WAF/CDN detection. Non-intrusive only.")
 
 # -----------------------
-# Constantes / firmas
+# Constants / signatures
 # -----------------------
 SEC_HEADERS = [
     "Strict-Transport-Security",
@@ -57,13 +57,13 @@ COMMON_API_PATHS = [
 
 IPINFO_URL = "https://ipinfo.io/{ip}/json"  # public (rate limited)
 CRTSH_URL = "https://crt.sh/?q=%25.{domain}&output=json"
-BUFFERO_VER = "https://dns.bufferover.run/dns?q=.{domain}"
+BUFFEROVER_URL = "https://dns.bufferover.run/dns?q=.{domain}"
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 MAILTO_REGEX = re.compile(r"mailto:([^\?\"'>]+)")
 
 # -----------------------
-# Utilidades básicas
+# Utilities
 # -----------------------
 def normalize_url(domain: str) -> str:
     d = domain.strip()
@@ -108,10 +108,26 @@ def check_tcp_port(ip: str, port: int, timeout: float = 0.8) -> bool:
         return False
 
 # -----------------------
-# Subdominios (passive)
+# Cookie Analyzer
 # -----------------------
-def discover_subdomains_crt(domain: str, pause: float = 0.5) -> list:
-    """Consulta crt.sh (CT logs) para descubrir subdominios."""
+def analyze_cookies(set_cookie_header: str) -> dict:
+    """
+    Analiza la cabecera Set-Cookie para detectar banderas de seguridad.
+    """
+    flags = {"Secure": "✅ Present", "HttpOnly": "✅ Present", "SameSite": "✅ Present"}
+    header_lower = (set_cookie_header or "").lower()
+    if "secure" not in header_lower:
+        flags["Secure"] = "❌ Missing"
+    if "httponly" not in header_lower:
+        flags["HttpOnly"] = "❌ Missing"
+    if "samesite" not in header_lower:
+        flags["SameSite"] = "❌ Missing"
+    return flags
+
+# -----------------------
+# Subdomains (passive)
+# -----------------------
+def discover_subdomains_crt(domain: str, pause: float = 0.2) -> list:
     out = set()
     try:
         url = CRTSH_URL.format(domain=domain)
@@ -123,7 +139,7 @@ def discover_subdomains_crt(domain: str, pause: float = 0.5) -> list:
                     nv = entry.get("name_value", "")
                     for line in nv.split("\n"):
                         if domain in line:
-                            out.add(line.strip())
+                            out.add(line.strip().lstrip("*."))
             except Exception:
                 pass
         sleep(pause)
@@ -134,29 +150,27 @@ def discover_subdomains_crt(domain: str, pause: float = 0.5) -> list:
 def discover_subdomains_bufferover(domain: str) -> list:
     out = set()
     try:
-        url = BUFFERO_VER.format(domain=domain)
+        url = BUFFEROVER_URL.format(domain=domain)
         r = requests.get(url, timeout=8)
         if r.status_code == 200:
             j = r.json()
-            for arr in j.get("FDNS_A", []) + j.get("RDNS", []):
+            # FDNS_A entries like "ip,sub.domain.com"
+            for t in j.get("FDNS_A", []) + j.get("RDNS", []) + j.get("Results", []):
                 try:
-                    # FDNS_A entries like "ip,sub.domain.com"
-                    if isinstance(arr, str) and "," in arr:
-                        parts = arr.split(",")
-                        candidate = parts[1].strip()
+                    if isinstance(t, str) and "," in t:
+                        candidate = t.split(",")[1].strip()
                         if domain in candidate:
-                            out.add(candidate)
+                            out.add(candidate.lstrip("*."))
+                    else:
+                        if isinstance(t, str) and domain in t:
+                            out.add(t.lstrip("*."))
                 except Exception:
                     pass
-            for name in j.get("Results", []):
-                if domain in name:
-                    out.add(name)
     except Exception:
         pass
     return sorted(out)
 
 def discover_subdomains(domain: str, limit:int=200) -> list:
-    """Combina fuentes pasivas para subdominios y limita la salida."""
     s = set()
     try:
         s.update(discover_subdomains_crt(domain))
@@ -166,7 +180,6 @@ def discover_subdomains(domain: str, limit:int=200) -> list:
         s.update(discover_subdomains_bufferover(domain))
     except Exception:
         pass
-    # Añade una dedup y sanity filter
     cleaned = [d.lower().strip().lstrip("*.") for d in s if domain in d]
     cleaned = sorted(set(cleaned))[:limit]
     return cleaned
@@ -178,21 +191,29 @@ def extract_emails_from_html(html: str) -> list:
     if not html:
         return []
     emails = set(EMAIL_REGEX.findall(html))
-    # mailto links
     for m in MAILTO_REGEX.findall(html):
         if EMAIL_REGEX.match(m.strip()):
             emails.add(m.strip())
+    # also use BeautifulSoup to find mailto hrefs
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().startswith("mailto:"):
+                candidate = href.split("mailto:")[1].split("?")[0]
+                if EMAIL_REGEX.match(candidate):
+                    emails.add(candidate)
+    except Exception:
+        pass
     return sorted(emails)
 
 def harvest_emails_from_hosts(hosts: list, max_pages_per_host: int = 4) -> dict:
-    """Intenta buscar emails en la raíz y páginas comunes de cada subdominio"""
     results = {}
     paths_to_try = ["/", "/contact", "/contacto", "/about", "/acerca", "/.well-known/security.txt", "/robots.txt"]
     for h in hosts:
         found = set()
         base = ("https://" + h) if not h.startswith(("http://","https://")) else h
         tried = 0
-        # first try root
         try:
             r = safe_get(base)
             if r and r.status_code==200:
@@ -200,9 +221,8 @@ def harvest_emails_from_hosts(hosts: list, max_pages_per_host: int = 4) -> dict:
                 tried += 1
         except Exception:
             pass
-        # other paths (limit)
         for p in paths_to_try:
-            if tried >= max_pages_per_host or tried >= max_pages_per_host + 1:
+            if tried >= max_pages_per_host:
                 break
             try:
                 r = safe_get(urllib.parse.urljoin(base, p))
@@ -251,7 +271,6 @@ def detect_waf_and_cdn(headers_raw: dict, domain: str) -> list:
             if s.lower() in raw_l:
                 found.append(name)
                 break
-    # heuristics via CNAME
     if not found:
         try:
             cnames = dns_query(domain, "CNAME")
@@ -261,7 +280,7 @@ def detect_waf_and_cdn(headers_raw: dict, domain: str) -> list:
                     found.append("AWS CloudFront (CNAME)")
                 if "cloudflare" in c_l:
                     found.append("Cloudflare (CNAME)")
-                if "akamaiedge" in c_l or "akamai" in c_l:
+                if "akamaiedge" in c_l or "akamaicdn" in c_l or "akamaiedge.net" in c_l:
                     found.append("Akamai (CNAME)")
         except Exception:
             pass
@@ -332,7 +351,6 @@ def shodan_lookup(ip: str) -> dict:
         return {"error": str(e)}
 
 def hunter_lookup(domain: str) -> dict:
-    """Optional: Hunter.io discovery if HUNTER_API_KEY in env."""
     key = os.environ.get("HUNTER_API_KEY")
     if not key:
         return {"error": "No HUNTER_API_KEY configured"}
@@ -519,7 +537,7 @@ def generate_pdf(domain: str,
     return fname
 
 # -----------------------
-# Recomendaciones builder
+# Recommendations builder
 # -----------------------
 def build_recommendations(missing_headers: list, waf_cdn: list, cookies_flags: dict, tls_ok: bool, exposure: list) -> list:
     recs = []
@@ -537,7 +555,7 @@ def build_recommendations(missing_headers: list, waf_cdn: list, cookies_flags: d
     return recs
 
 # -----------------------
-# UI y flujo principal
+# UI and main flow
 # -----------------------
 with st.form("exposure_form"):
     domain_input = st.text_input("Domain (example.com):", value="", placeholder="example.com")
@@ -598,7 +616,6 @@ if submit:
 
         # Harvest emails (root + discovered subdomains sample)
         email_hosts = [hostname]
-        # include top N subdomains for email harvesting to avoid excessive queries
         if subdomains:
             email_hosts += subdomains[:20]
         emails_found = harvest_emails_from_hosts(email_hosts, max_pages_per_host=3)
