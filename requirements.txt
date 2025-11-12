@@ -1,6 +1,6 @@
 streamlit
 requests
-fpdf2
 dnspython
 beautifulsoup4
 tldextract
+python-whois
