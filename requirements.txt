@@ -2,5 +2,5 @@ streamlit
 requests
 dnspython
 beautifulsoup4
-tldextract
 python-whois
+tldextract
