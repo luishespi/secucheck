@@ -1,574 +1,514 @@
-# clouddefender_app.py
-"""
-CloudDefender — Passive + Ethical-Aggressive Exposure Scanner (Streamlit)
-Safe: solo GET/HEAD/TCP handshakes ligeros. No fuzzing, no brute force, no DDoS.
-Propósito: generar evidencia convincente para CISO/CFO y recomendaciones (incluye propuestas Cloudflare).
-"""
+# clouddefender_modular.py
+# CloudDefender – Modular Passive Exposure Scanner (Educational & Ethical)
+# Author: Eton / The Cloud Defender
+# NOTE: For awareness and education. Only scan domains you own or have permission to analyze.
 
-import re, socket, ssl, urllib.parse, json, time
-from datetime import datetime
-from time import sleep
-
+import streamlit as st
 import requests
+import socket
+import ssl
+import json
+import re
 import dns.resolver
 import tldextract
 import whois
 from bs4 import BeautifulSoup
-import streamlit as st
+from datetime import datetime
+from time import sleep
 
-# ---------------- UI / Config ----------------
-st.set_page_config(page_title="CloudDefender", layout="wide")
-st.title("🛡️ CloudDefender — Passive + Ethical-Aggressive Scanner")
-st.markdown("Recon pasivo y pruebas seguras (lectura). **No** realiza ataques. Para pruebas activas se pide autorización por escrito.")
+# ===================== CONFIG =====================
 
-# ---------------- Constants ----------------
-COMMON_PORTS = [
-    # Web & proxies
-    80,443,8080,8443,8888,
-    # Admin
-    22,3389,5900,5985,5986,
-    # Databases
-    3306,5432,1433,1521,27017,6379,9200,
-    # Mail / LDAP
-    25,110,143,465,587,993,995,389,636,
-    # Files / SMB
-    21,23,139,445,2049,111,873,
-    # Monitoring / Dev
-    161,5601,15672,9092,9090,2181,3000,8081,5000,2375,4243
-]
+st.set_page_config(page_title="CloudDefender Modular", layout="wide")
+st.title("🛡️ CloudDefender – Modular Exposure Scanner (Passive & Educational)")
+st.caption("Solo OSINT y reconocimiento pasivo. Úsalo para concientizar, no para atacar.")
 
+COMMON_PORTS = [21,22,25,53,80,110,143,443,465,587,993,995,1433,1521,3306,3389,5432,5900,6379,8080,8443,9200,27017,5000,8081]
 SEC_HEADERS = ["Strict-Transport-Security","Content-Security-Policy","X-Frame-Options","X-Content-Type-Options","Referrer-Policy"]
-WAF_SIGNATURES = {
-    "Cloudflare": ["cf-ray","cf-cache-status","server: cloudflare","cf-"],
-    "Akamai": ["akamai","akamaiedge"],
-    "Imperva": ["incapsula","x-iinfo"],
-    "AWS CloudFront": ["cloudfront","x-amz-cf-id"],
-    "Fastly": ["fastly"],
-    "Sucuri": ["x-sucuri-id","sucuri"],
-    "Azure Frontdoor": ["azurefd","x-azure-ref"],
-}
 
-TAKEOVER_CNAME_HINTS = {
-    "github.io":"GitHub Pages",
-    "herokuapp.com":"Heroku",
-    "azurewebsites.net":"Azure App Service",
-    "s3.amazonaws.com":"AWS S3",
-    "storage.googleapis.com":"GCS",
-    "wpengine.com":"WP Engine",
-}
+# ===================== HELPERS =====================
 
-CORS_TEST_ORIGIN = "https://bad.origin.example"
-EMAIL_RX = re.compile(r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-.]+")
+def safe_get(url, timeout=8, headers=None):
+    h = {
+        "User-Agent": "Mozilla/5.0 (compatible; CloudDefender/1.0)",
+        "Accept": "*/*",
+    }
+    if headers:
+        h.update(headers)
+    try:
+        return requests.get(url, headers=h, timeout=timeout, allow_redirects=True)
+    except Exception:
+        return None
 
-# ---------------- Helpers ----------------
-def normalize(domain: str) -> str:
-    d = domain.strip()
+def normalize_domain(d: str) -> str:
+    d = d.strip()
     if not d.startswith(("http://","https://")):
         return "https://" + d
     return d
 
-def safe_get(url, timeout=8, headers=None):
-    hdr = {"User-Agent": "Mozilla/5.0 (compatible; CloudDefender/1.0)", "Accept": "*/*"}
-    if headers:
-        hdr.update(headers)
+def dns_query(name, qtype):
     try:
-        r = requests.get(url, timeout=timeout, headers=hdr, allow_redirects=True)
-        return r
-    except Exception:
-        return None
-
-def dns_query(name, qtype, lifetime=5):
-    try:
-        return [str(x).strip() for x in dns.resolver.resolve(name, qtype, lifetime=lifetime)]
+        return [str(x) for x in dns.resolver.resolve(name, qtype)]
     except Exception:
         return []
 
-def get_ips(hostname):
+def get_ips(domain):
     try:
-        ai = socket.getaddrinfo(hostname, None)
-        return sorted({x[4][0] for x in ai})
+        return sorted({x[4][0] for x in socket.getaddrinfo(domain, None)})
     except Exception:
         return []
 
-def reverse_dns(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return None
-
-def tcp_handshake(ip, port, timeout=0.6):
+def tcp_handshake(ip, port, timeout=0.5):
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
     except Exception:
         return False
 
-def cert_info(hostname, port=443):
+def cert_info(domain):
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection((hostname, port), timeout=6) as sock:
-            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+        with socket.create_connection((domain, 443), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
-                notafter = cert.get("notAfter")
-                if notafter:
-                    exp = datetime.strptime(notafter, "%b %d %H:%M:%S %Y %Z")
-                    return {"valid": True, "expires_days": (exp - datetime.utcnow()).days, "issuer": cert.get("issuer")}
+                exp = cert.get("notAfter")
+                if exp:
+                    dt = datetime.strptime(exp, "%b %d %H:%M:%S %Y %Z")
+                    return {
+                        "valid": True,
+                        "days_left": (dt - datetime.utcnow()).days,
+                        "issuer": cert.get("issuer"),
+                    }
     except Exception:
-        pass
+        return {"valid": False}
     return {"valid": False}
 
-def analyze_cookies(set_cookie):
-    s = (set_cookie or "").lower()
-    return {
-        "Secure": "✅" if "secure" in s else "❌",
-        "HttpOnly": "✅" if "httponly" in s else "❌",
-        "SameSite": "✅" if "samesite" in s else "❌"
-    }
+def find_emails(html):
+    if not html:
+        return []
+    rx = r"[a-zA-Z0-9_.+\-]+@[a-zA-Z0-9\-]+\.[a-zA-Z0-9\-.]+"
+    return sorted(set(re.findall(rx, html)))[:50]
 
-def detect_waf(headers, domain):
-    raw = " ".join([f"{k}:{v}" for k,v in (headers or {}).items()]).lower()
-    found=[]
-    for k, sigs in WAF_SIGNATURES.items():
-        if any(sig in raw for sig in sigs):
-            found.append(k)
-    # CNAME hint
-    cn = dns_query(domain,"CNAME")
-    for c in cn:
-        cl = c.lower()
-        if "cloudfront" in cl and "AWS CloudFront" not in found: found.append("AWS CloudFront (CNAME)")
-        if "cloudflare" in cl and "Cloudflare (CNAME)" not in found: found.append("Cloudflare (CNAME)")
-    return found or ["❌ None detected"]
-
-# ---------- Ethical-Aggressive detectors (safe reads) ----------
-
-def token_leak_detector(text):
-    if not text: return []
+def token_leaks(text):
+    if not text:
+        return []
     patterns = [
-        r"api[_-]?key\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{8,})['\"]?",
         r"sk_live_[A-Za-z0-9]{8,}",
         r"pk_live_[A-Za-z0-9]{8,}",
-        r"pk_test_[A-Za-z0-9]{8,}",
-        r"bearer\s+([A-Za-z0-9\-\._]{8,})",
-        r"paypal[_\-]?client[_\-]?id",
-        r"stripe[_\-]?(key|client|pk|sk)"
+        r"bearer\s+[A-Za-z0-9\-\._]{10,}",
+        r"api[_-]?key\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{10,})"
     ]
-    leaks=set()
+    found = []
     for p in patterns:
-        for m in re.findall(p, text, flags=re.IGNORECASE):
-            leaks.add((p, m if isinstance(m,str) else (m[0] if isinstance(m,tuple) else str(m))))
-    return list(leaks)
+        found += re.findall(p, text, flags=re.IGNORECASE)
+    # flatten when group returns tuples
+    flat = []
+    for f in found:
+        if isinstance(f, tuple):
+            flat.append(f[0])
+        else:
+            flat.append(f)
+    return sorted(set(flat))[:15]
 
-def js_source_audit(html, base):
-    scripts = []
+def detect_tech(html, headers):
+    tech = []
+    h = (html or "").lower()
+    full_headers = " ".join([f"{k}:{v}" for k,v in (headers or {}).items()]).lower()
+    combo = h + " " + full_headers
+
+    if "wp-content" in combo: tech.append("WordPress")
+    if "woocommerce" in combo: tech.append("WooCommerce")
+    if "magento" in combo: tech.append("Magento")
+    if "nginx" in combo: tech.append("Nginx")
+    if "apache" in combo: tech.append("Apache")
+    if "cloudflare" in combo: tech.append("Cloudflare (edge)")
+    if "shopify" in combo: tech.append("Shopify")
+    if "wix" in combo or "wixstatic" in combo: tech.append("Wix")
+    if "react" in combo or "_next" in combo: tech.append("React / Next.js")
+    return sorted(set(tech))
+
+def estimate_traffic(domain):
+    # Heurística ultra simple: no depende de servicios de pago
+    # Aquí solo damos un mensaje de ejemplo, puedes cambiarlo luego.
+    return {
+        "rank": ">1M (no en listas públicas altas)",
+        "visibility": "Low / Medium (estimado)"
+    }
+
+def get_asn_info(ip):
     try:
-        soup = BeautifulSoup(html or "", "html.parser")
-        for s in soup.find_all("script", src=True):
-            src = s.get("src")
-            if not src: continue
-            full = urllib.parse.urljoin(base, src)
-            scripts.append(full)
+        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
+        if r.ok:
+            j = r.json()
+            return {
+                "ip": ip,
+                "country": j.get("country_name"),
+                "org": j.get("org"),
+                "asn": j.get("asn"),
+            }
     except Exception:
         pass
-    report={}
-    for s in scripts[:5]:
-        r = safe_get(s, timeout=6)
-        if not r: continue
-        sample = r.text[:4000]
-        tokens = token_leak_detector(sample)
-        report[s] = {"status": r.status_code, "size_kb": len(r.text)//1024, "token_hints": tokens[:5]}
-        time.sleep(0.25)
-    return report
+    return {"ip": ip, "error": "lookup_failed"}
 
-def ecommerce_endpoints_check(base):
-    targets = [
-        "/cart","/checkout","/order","/orders","/api/checkout","/api/cart",
-        "/payment","/api/payment","/billing","/api/billing","/payment_intents",
-        "/graphql","/api/v1/checkout","/api/v1/orders","/wp-json/wc/v3/orders"
+def related_domains(domain):
+    base = domain.split(".")[0]
+    results = []
+    for tld in ["com","net","org","mx","io","co"]:
+        d = f"{base}.{tld}"
+        try:
+            dns.resolver.resolve(d, "A")
+            results.append(d)
+        except Exception:
+            continue
+    return sorted(set(results))
+
+def typo_domains(domain):
+    base = domain.split(".")[0]
+    variants = [
+        base+"s",
+        base[:-1],
+        base+"-security",
+        base.replace("o","0"),
+        base+"defense"
     ]
-    findings={}
-    for p in targets:
-        url = urllib.parse.urljoin(base, p.lstrip("/"))
-        r = safe_get(url, timeout=6)
-        if not r: continue
-        ct = r.headers.get("Content-Type","")
-        info={"status": r.status_code, "content_type": ct}
-        if "application/json" in ct:
+    found=[]
+    for v in variants:
+        for tld in ["com","net","mx","co"]:
+            d=f"{v}.{tld}"
             try:
-                j = r.json()
-                if isinstance(j, dict):
-                    info["json_keys_sample"] = list(j.keys())[:8]
+                dns.resolver.resolve(d,"A")
+                found.append(d)
             except Exception:
-                pass
-        findings[url]=info
-        sleep(0.2)
-    return findings
+                continue
+    return sorted(set(found))
 
-def error_leakage_detector(base, html):
-    # look in main page + common debug paths for strings indicating stacktraces or DB errors
-    indicators=["traceback","exception","sql syntax","fatal error","stacktrace","java.lang","php error","uncaught exception","at com."]
-    leaks={}
-    urls=[base, urllib.parse.urljoin(base,"/debug"), urllib.parse.urljoin(base,"/status"), urllib.parse.urljoin(base,"/api/health")]
-    for u in urls:
-        r = safe_get(u, timeout=5)
-        if not r: continue
-        text = (r.text or "").lower()[:6000]
-        matches=[i for i in indicators if i in text]
-        if matches:
-            leaks[u] = {"status": r.status_code, "matches": sorted(matches)}
-        sleep(0.2)
-    return leaks
+def exposure_index(subdomains, open_ports, tech, leaks):
+    score = len(subdomains)*2 + len(open_ports)*3 + len(tech)*2 + len(leaks)*5
+    if score < 10:
+        return "Low", score
+    elif score < 25:
+        return "Medium", score
+    else:
+        return "High", score
 
-def graphql_introspection_probe(base):
-    # very light: send a POST with a small introspection query (safe, read-only)
-    url = urllib.parse.urljoin(base, "/graphql")
-    payload = {"query":"{ __schema { queryType { name } } }"}
+def crt_sh_subdomains(domain):
+    out = set()
     try:
-        r = requests.post(url, json=payload, timeout=5, headers={"User-Agent":"CloudDefender/1.0"})
-        if r and r.status_code==200:
-            j = None
-            try: j = r.json()
-            except Exception: pass
-            return {"status": r.status_code, "json_sample_keys": list(j.keys())[:6] if isinstance(j,dict) else None}
-    except Exception:
-        pass
-    return {}
-
-def public_bucket_hint_detector(html, cnames):
-    hints=[]
-    raw=(html or "").lower()
-    if "s3.amazonaws.com" in raw or ".s3.amazonaws.com" in raw:
-        hints.append("References to s3.amazonaws.com found in HTML — revisar permisos del bucket.")
-    if "storage.googleapis.com" in raw:
-        hints.append("References to storage.googleapis.com found — revisar permisos GCS.")
-    for c in cnames:
-        cl=c.lower()
-        if "amazonaws.com" in cl:
-            hints.append(f"CNAME {c} apunta a AWS — verificar si es bucket público.")
-        if "storage.googleapis.com" in cl:
-            hints.append(f"CNAME {c} apunta a GCS — verificar si es bucket público.")
-    return hints
-
-def takeover_heuristic(domain, cnames, subdomains):
-    suspects=[]
-    for c in cnames + subdomains:
-        cl=c.lower()
-        for pat, prov in TAKEOVER_CNAME_HINTS.items():
-            if pat in cl:
-                suspects.append({"target":c,"provider":prov,"advisory":"Possible take-over vector — verify resource ownership"})
-    return suspects
-
-def spf_dmarc(domain):
-    txts = dns_query(domain, "TXT")
-    spf = [t for t in txts if "v=spf1" in t.lower()]
-    dmarc = dns_query("_dmarc."+domain, "TXT")
-    policy = None
-    if dmarc:
-        m = re.search(r"p=([a-zA-Z\-]+)", " ".join(dmarc))
-        if m: policy = m.group(1)
-    return {"spf": bool(spf), "dmarc": bool(dmarc), "dmarc_policy": policy or "N/A", "spf_records": spf}
-
-def cve_hint_links(techs):
-    base = "https://nvd.nist.gov/vuln/search/results?query="
-    return {t: base + urllib.parse.quote(t) for t in techs}
-
-def tech_hint_detector(html):
-    hints=[]
-    raw=(html or "").lower()
-    if "wp-content" in raw: hints.append("WordPress")
-    if "woocommerce" in raw: hints.append("WooCommerce")
-    if "shopify" in raw: hints.append("Shopify")
-    if "wixstatic" in raw: hints.append("Wix")
-    if "_next" in raw: hints.append("Next.js/React")
-    if "magento" in raw: hints.append("Magento")
-    return sorted(set(hints))
-
-def whois_info(domain):
-    try:
-        d = whois.whois(domain)
-        return {"domain": domain, "created": str(d.creation_date), "expires": str(d.expiration_date), "registrar": d.registrar}
-    except Exception:
-        return {}
-
-# ---------- Main UI form ----------
-with st.form("scan"):
-    col1, col2 = st.columns([3,1])
-    with col1:
-        domain_input = st.text_input("Domain (example.com)", value="", placeholder="example.com")
-    with col2:
-        scan_sub = st.form_submit_button("Run Deep Passive Scan (safe)")
-st.markdown("---")
-if not scan_sub:
-    st.info("Ingresa un dominio y presiona 'Run Deep Passive Scan (safe)'")
-    st.stop()
-
-if not domain_input.strip():
-    st.error("Ingresa un dominio válido."); st.stop()
-
-target = domain_input.strip()
-base_url = normalize(target)
-hostname = urllib.parse.urlparse(base_url).hostname
-
-st.success(f"Starting CloudDefender scan for {hostname} — safe passive checks only. Please allow ~20s.")
-
-# ---------- baseline fetch ----------
-r = safe_get(base_url)
-headers = r.headers if r else {}
-html = r.text if r and r.text else ""
-
-# ---------- Basic findings ----------
-sec = {h: headers.get(h, "❌ Missing") for h in SEC_HEADERS}
-sec["Status"] = r.status_code if r else "N/A"
-cookies_flags = analyze_cookies(headers.get("Set-Cookie",""))
-ips = get_ips(hostname)
-ptrs = {ip: reverse_dns(ip) for ip in ips}
-dns_all = {t: dns_query(hostname, t) for t in ["A","AAAA","MX","NS","TXT","CNAME","SOA"]}
-
-tls = cert_info(hostname)
-waf = detect_waf(headers, hostname)
-spf = spf_dmarc(hostname)
-who = whois_info(hostname)
-techs = tech_hint_detector(html)
-cve_links = cve_hint_links(techs)
-
-# ---------- Ethical-aggressive modules ----------
-# 1 Token leaks
-token_leaks = token_leak_detector(html)
-
-# 2 JS audit
-js_audit = js_source_audit(html, base_url)
-
-# 3 Ecommerce endpoints
-ecom = ecommerce_endpoints_check(base_url)
-
-# 4 Error leakage
-err_leaks = error_leakage_detector(base_url, html)
-
-# 5 GraphQL light probe
-graphql = graphql_introspection_probe(base_url)
-
-# 6 Public bucket hints
-cname_list = dns_all.get("CNAME",[])
-bucket_hints = public_bucket_hint_detector(html, cname_list)
-
-# 7 Subdomain takeovers heuristic
-# passive subdomain discovery (crt.sh)
-def crt_sh_subs(domain):
-    out=set()
-    try:
-        url=f"https://crt.sh/?q=%25.{domain}&output=json"
-        r=requests.get(url, timeout=6)
-        if r.status_code==200:
-            data=r.json()
+        r = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=6)
+        if r.ok:
+            data = r.json()
             for e in data:
-                nv=e.get("name_value","")
-                for line in nv.splitlines():
+                value = e.get("name_value","")
+                for line in value.splitlines():
                     if domain in line:
-                        out.add(line.strip().lstrip("*."))
+                        out.add(line.strip())
     except Exception:
         pass
     return sorted(out)
 
-subdomains = crt_sh_subs(hostname)[:300]
-takeover = takeover_heuristic(hostname, cname_list, subdomains)
+# ===================== SIDEBAR (MODULE TOGGLES) =====================
 
-# 8 TLS/SSL analyzer (basic)
-ssl_issues = []
-if tls.get("valid"):
-    if tls.get("expires_days",999) < 30:
-        ssl_issues.append("Certificate expiring in <30 days")
-else:
-    ssl_issues.append("Could not validate certificate (handshake failed)")
+st.sidebar.header("Modules")
+mod_dns        = st.sidebar.checkbox("DNS & WHOIS", value=True)
+mod_http       = st.sidebar.checkbox("HTTP & Security headers", value=True)
+mod_tls        = st.sidebar.checkbox("TLS / Certificate", value=True)
+mod_ips_ports  = st.sidebar.checkbox("IPs & Quick Port Check (safe)", value=True)
+mod_subdomains = st.sidebar.checkbox("Subdomains (crt.sh passive)", value=True)
+mod_tech       = st.sidebar.checkbox("Tech stack detection", value=True)
+mod_emails     = st.sidebar.checkbox("Emails & token hints", value=True)
+mod_asn        = st.sidebar.checkbox("ASN & GeoIP", value=True)
+mod_typo       = st.sidebar.checkbox("Typo / brand variants", value=True)
+mod_exposure   = st.sidebar.checkbox("Exposure score + Cloudflare recos", value=True)
 
-# 9 Port quick handshake (safe): only test first 3 IPs and only short timeout
-port_results={}
-for ip in ips[:3]:
-    port_results[ip] = {}
-    for p in COMMON_PORTS:
-        # skip too noisy ports for public demo? we'll keep it short timeout
-        try:
-            ok = tcp_handshake(ip,p, timeout=0.5)
-            port_results[ip][p] = ok
-        except Exception:
-            port_results[ip][p] = False
+st.sidebar.markdown("---")
+st.sidebar.caption("ADVANCED_HOOKS: aquí puedes agregar después tus módulos de pentesting ligero SOLO para entornos controlados.")
 
-# 10 HIBP (optional): check if any harvested emails appear in breaches (requires API key)
-# We'll only detect emails from public pages and offer guidance — not auto-query HIBP unless env var provided
-harvested_emails = []
-# harvest from homepage and common pages
-def find_emails_in_html(text):
-    return list(set(EMAIL_RX.findall(text or "")))
-harvested_emails += find_emails_in_html(html)
-for p in ["/contact","/about","/security.txt","/robots.txt"]:
+# ===================== MAIN FORM =====================
+
+st.markdown("---")
+domain_input = st.text_input("Domain to analyze (example.com)", "")
+
+run_btn = st.button("Run Modular Passive Scan")
+
+if not run_btn:
+    st.stop()
+
+if not domain_input.strip():
+    st.error("Por favor ingresa un dominio válido.")
+    st.stop()
+
+normalized = normalize_domain(domain_input)
+hostname = tldextract.extract(normalized).registered_domain or domain_input.strip()
+
+st.info(f"Escaneando de forma pasiva: **{hostname}** (solo OSINT / GET / DNS / TLS)")
+
+# ===================== BASELINE HTTP REQUEST =====================
+
+base_url = normalize_domain(hostname)
+r = safe_get(base_url, timeout=10)
+html = r.text if r else ""
+headers = r.headers if r else {}
+
+# ===================== MODULE EXECUTION =====================
+
+results = {}
+
+# --- DNS & WHOIS ---
+if mod_dns:
+    dns_data = {
+        "A": dns_query(hostname, "A"),
+        "AAAA": dns_query(hostname, "AAAA"),
+        "MX": dns_query(hostname, "MX"),
+        "NS": dns_query(hostname, "NS"),
+        "TXT": dns_query(hostname, "TXT"),
+        "CNAME": dns_query(hostname, "CNAME"),
+        "SOA": dns_query(hostname, "SOA"),
+    }
     try:
-        rr = safe_get(urllib.parse.urljoin(base_url,p))
-        if rr and rr.status_code==200:
-            harvested_emails += find_emails_in_html(rr.text)
+        who = whois.whois(hostname)
+        who_data = {
+            "domain": hostname,
+            "created": str(who.creation_date),
+            "expires": str(who.expiration_date),
+            "registrar": who.registrar,
+        }
     except Exception:
-        pass
-harvested_emails = sorted(set(harvested_emails))[:50]
+        who_data = {"error":"WHOIS lookup failed"}
+    results["dns"] = dns_data
+    results["whois"] = who_data
 
-# ---------- Scoring ----------
-score = 100
-missing_headers = [h for h in SEC_HEADERS if "Missing" in str(sec.get(h))]
-score -= 6 * len(missing_headers)
-if waf == ["❌ None detected"]: score -= 12
-if not spf.get("spf"): score -= 8
-if not spf.get("dmarc"): score -= 10
-if token_leaks: score -= 20
-if any(any(port_results[ip].get(p) for p in [22,3389,445,3306,1433]) for ip in port_results): score -= 15
-if err_leaks: score -= 10
-if ssl_issues: score -= 6
-if bucket_hints: score -= 8
-if takeover: score -= 12
-score = max(0,min(100,score))
-grade = "A" if score>90 else "B" if score>75 else "C" if score>60 else "D" if score>45 else "F"
+# --- HTTP & Security headers ---
+if mod_http:
+    sec_headers = {h: headers.get(h, "Missing") for h in SEC_HEADERS}
+    status = r.status_code if r else "N/A"
+    server = headers.get("Server","Unknown")
+    results["http"] = {
+        "status_code": status,
+        "server": server,
+        "security_headers": sec_headers,
+    }
 
-# ---------- Executive summary ----------
-st.header("Executive summary")
-st.markdown(f"**Grade:** {grade} ({score}%)")
-st.markdown(f"**WAF/CDN:** {', '.join(waf)}")
-st.markdown(f"**Missing security headers:** {', '.join(missing_headers) if missing_headers else 'None'}")
-st.markdown(f"**SPF/DMARC:** SPF={'✅' if spf['spf'] else '❌'} | DMARC={'✅' if spf['dmarc'] else '❌'} (policy: {spf['dmarc_policy']})")
-if tls.get("valid"):
-    st.markdown(f"**TLS:** certificado válido — expira en ~{tls.get('expires_days')} días")
-else:
-    st.markdown("**TLS:** handshake no validado (PaaS o bloqueo).")
+# --- TLS / Certificate ---
+if mod_tls:
+    cert = cert_info(hostname)
+    results["tls"] = cert
 
-# financial estimator tiny (example)
-monthly_revenue = st.number_input("Optional: Monthly revenue (USD) to estimate impact", value=0.0, step=100.0)
-if monthly_revenue and score < 70:
-    # naive estimator:
-    breach_prob = (100 - score)/100.0 * 0.2   # example
-    avg_breach_cost = max(100000, monthly_revenue*2) 
-    expected_annual_loss = breach_prob * avg_breach_cost
-    st.markdown(f"**Estimated annual loss (very rough):** ${expected_annual_loss:,.0f} (based on score & revenue)")
+# --- IPs & Ports ---
+if mod_ips_ports:
+    ips = get_ips(hostname)
+    port_scan = []
+    for ip in ips[:2]:
+        for p in COMMON_PORTS:
+            ok = tcp_handshake(ip, p, timeout=0.3)
+            if ok:
+                port_scan.append({"ip": ip, "port": p})
+    results["ips"] = ips
+    results["ports"] = port_scan
+
+# --- Subdomains ---
+if mod_subdomains:
+    subs = crt_sh_subdomains(hostname)
+    results["subdomains"] = subs
+
+# --- Tech stack ---
+if mod_tech:
+    tech = detect_tech(html, headers)
+    traffic = estimate_traffic(hostname)
+    results["tech"] = {"stack": tech, "traffic_estimate": traffic}
+
+# --- Emails & tokens ---
+if mod_emails:
+    emails = find_emails(html)
+    leaks = token_leaks(html)
+    results["emails"] = emails
+    results["token_hints"] = leaks
+
+# --- ASN & GeoIP ---
+if mod_asn:
+    ips_for_asn = results.get("ips") or get_ips(hostname)
+    asn_info = [get_asn_info(ip) for ip in ips_for_asn[:5]]
+    results["asn"] = asn_info
+
+# --- Typo / brand variants ---
+if mod_typo:
+    typos = typo_domains(hostname)
+    related = related_domains(hostname)
+    results["typo"] = {
+        "typo_domains_active": typos,
+        "related_domains": related
+    }
+
+# --- Exposure score ---
+if mod_exposure:
+    subs = results.get("subdomains") or []
+    ports = results.get("ports") or []
+    tech = (results.get("tech") or {}).get("stack", [])
+    leaks = results.get("token_hints") or []
+    exposure_level, exposure_score_raw = exposure_index(subs, ports, tech, leaks)
+    results["exposure"] = {
+        "level": exposure_level,
+        "score": exposure_score_raw
+    }
+
+# ===================== OUTPUT UI =====================
 
 st.markdown("---")
+st.header("Executive Summary")
 
-# ---------- Details expanders ----------
-with st.expander("Security headers"):
-    st.json(sec)
+exposure_level = results.get("exposure", {}).get("level", "N/A")
+exposure_score_raw = results.get("exposure", {}).get("score", 0)
+stack = (results.get("tech") or {}).get("stack", [])
+traffic_est = (results.get("tech") or {}).get("traffic_estimate", {})
+status = (results.get("http") or {}).get("status_code", "N/A")
+server = (results.get("http") or {}).get("server", "Unknown")
 
-with st.expander("Cookies flags"):
-    st.json(cookies_flags)
+st.markdown(f"- **Domain:** `{hostname}`")
+st.markdown(f"- **Exposure Level:** **{exposure_level}** (score interno: {exposure_score_raw})")
+st.markdown(f"- **HTTP Status:** {status}")
+st.markdown(f"- **Server (header):** {server}")
+st.markdown(f"- **Stack detectado:** {', '.join(stack) if stack else 'Unknown'}")
+st.markdown(f"- **Tráfico estimado:** {traffic_est.get('rank','?')} — {traffic_est.get('visibility','?')}")
 
-with st.expander("DNS & WHOIS"):
-    st.json({"dns": dns_all, "whois": who})
+emails = results.get("emails") or []
+token_hints = results.get("token_hints") or []
+ports = results.get("ports") or []
+subs = results.get("subdomains") or []
 
-with st.expander("Resolved IPs & PTR"):
-    st.json({"ips": ips, "ptrs": ptrs})
+st.markdown(f"- **Emails públicos detectados (sample):** {len(emails)}")
+st.markdown(f"- **Token/API key hints (frontend):** {len(token_hints)}")
+st.markdown(f"- **Open ports (quick check):** {len(ports)}")
+st.markdown(f"- **Subdomains (crt.sh passive):** {len(subs)}")
 
-with st.expander("WAF / CDN detection"):
-    st.json(waf)
+st.markdown("---")
+st.header("Details by Module")
 
-with st.expander("TLS info & issues"):
-    st.json({"tls": tls, "issues": ssl_issues})
+if mod_dns:
+    with st.expander("DNS & WHOIS"):
+        st.json({"dns": results.get("dns"), "whois": results.get("whois")})
 
-with st.expander("SPF / DMARC analysis"):
-    st.json(spf)
+if mod_http:
+    with st.expander("HTTP & Security headers"):
+        st.json(results.get("http"))
 
-with st.expander("Harvested emails (sample)"):
-    st.json(harvested_emails or ["No public emails found"])
+if mod_tls:
+    with st.expander("TLS / Certificate"):
+        st.json(results.get("tls"))
 
-with st.expander("Token leaks found in HTML"):
-    st.json(token_leaks or ["No token patterns found in main HTML"])
+if mod_ips_ports:
+    with st.expander("IPs & Quick Port Handshake"):
+        st.json({"ips": results.get("ips"), "ports_open": results.get("ports")})
 
-with st.expander("JS source audit (top scripts)"):
-    st.json(js_audit or {"info":"No public scripts or nothing suspicious"})
+if mod_subdomains:
+    with st.expander("Subdomains (crt.sh passive)"):
+        st.json(results.get("subdomains"))
 
-with st.expander("Ecommerce & payment endpoints (safe probes)"):
-    st.json(ecom or {"info":"No common endpoints detected"})
+if mod_tech:
+    with st.expander("Tech stack & Traffic estimate"):
+        st.json(results.get("tech"))
 
-with st.expander("GraphQL introspection (light probe)"):
-    st.json(graphql or {"info":"No accessible GraphQL or no introspection data returned"})
+if mod_emails:
+    with st.expander("Emails & token hints"):
+        st.json({
+            "emails_public": results.get("emails"),
+            "token_hints": results.get("token_hints")
+        })
 
-with st.expander("Error leakage (stacktraces / DB errors)"):
-    st.json(err_leaks or {"info":"No obvious error leakage detected"})
+if mod_asn:
+    with st.expander("ASN & GeoIP"):
+        st.json(results.get("asn"))
 
-with st.expander("Public bucket / CDN hints"):
-    st.json(bucket_hints or ["No public bucket hints in HTML/CNAMEs"])
+if mod_typo:
+    with st.expander("Typo / brand variants & related domains"):
+        st.json(results.get("typo"))
 
-with st.expander("Subdomains (crt.sh passive)"):
-    st.json(subdomains[:200] or ["No passive subdomains found"])
+if mod_exposure:
+    with st.expander("Exposure Score (internal)"):
+        st.json(results.get("exposure"))
 
-with st.expander("Subdomain takeover heuristic"):
-    st.json(takeover or ["No takeover indicators"])
+# ===================== CLOUDFLARE RECOMMENDATIONS =====================
 
-with st.expander("Quick port handshake (safe)"):
-    st.json(port_results)
+st.markdown("---")
+st.header("Cloudflare-oriented Recommendations (High-level)")
 
-with st.expander("Technology hints & CVE search links"):
-    st.json({"techs": techs, "cve_links": cve_links})
+recs = []
 
-# ---------- Recommendations mapped to Cloudflare services ----------
-st.header("Recommendations & How Cloudflare helps (examples)")
-reco = []
+sec_headers = (results.get("http") or {}).get("security_headers", {}) if mod_http else {}
+missing_headers = [h for h,v in sec_headers.items() if v == "Missing"]
+
 if missing_headers:
-    reco.append({
-        "issue":"Security headers missing",
-        "fix":"Configure HSTS, Content-Security-Policy, X-Frame-Options and X-Content-Type-Options on origin or via Cloudflare Transform Rules / Page Rules.",
-        "cloudflare":"Use Cloudflare Rules to add security headers at the edge (Workers or Transform Rules)."
-    })
-if waf == ["❌ None detected"]:
-    reco.append({
-        "issue":"No WAF / CDN detected",
-        "fix":"Place site behind a WAF / CDN — block known bad bots, enable OWASP rules.",
-        "cloudflare":"Cloudflare Free includes basic WAF protections, enable Managed Rules + custom WAF rules for checkout endpoints."
-    })
-if token_leaks:
-    reco.append({
-        "issue":"Exposed tokens/keys in frontend",
-        "fix":"Rotate exposed keys immediately. Move secrets to server-side. Review CI/CD pipelines.",
-        "cloudflare":"Use Cloudflare Access / Zero Trust for backend APIs, and set up API Tokens and RBAC for internal services."
-    })
-if any(p for ip in port_results for p in port_results[ip] if port_results[ip][p] and p in [22,3389,3306,1433,445]):
-    reco.append({
-        "issue":"Administrative ports reachable from Internet",
-        "fix":"Close administrative ports at firewall; expose only via VPN or Zero Trust Access.",
-        "cloudflare":"Cloudflare Access + Cloudflare Tunnel (warp/Argo Tunnel) to expose apps without opening public ports."
-    })
-if bucket_hints:
-    reco.append({
-        "issue":"Public buckets referenced",
-        "fix":"Ensure S3/GCS buckets are private; use signed URLs for assets.",
-        "cloudflare":"Use Cloudflare R2 + signed URLs or restrict origin to Cloudflare only and use Origin Access."
-    })
-if takeover:
-    reco.append({
-        "issue":"Possible subdomain takeover",
-        "fix":"Verify and claim dangling CNAME targets or remove CNAMEs.",
-        "cloudflare":"Use DNS monitoring and alerting; fix/remove dangling CNAMEs and add monitoring to CloudDefender."
+    recs.append({
+        "issue": f"Missing security headers: {', '.join(missing_headers)}",
+        "fix": "Configurar HSTS, CSP, X-Frame-Options, X-Content-Type-Options y Referrer-Policy.",
+        "cloudflare": "Usar Cloudflare Transform Rules o Workers para inyectar headers de seguridad desde el edge."
     })
 
-for r in reco:
-    st.markdown(f"**{r['issue']}** — {r['fix']}  \n*Cloudflare suggestion:* {r['cloudflare']}")
+if not stack or ("Cloudflare (edge)" not in stack and "WAF" not in server.lower()):
+    recs.append({
+        "issue": "No se detecta un WAF/CDN claro frente al sitio.",
+        "fix": "Colocar la aplicación detrás de un WAF para bloqueo de ataques y caching inteligente.",
+        "cloudflare": "Activar Cloudflare (Free/Pro/Enterprise) y habilitar Managed Rules + reglas personalizadas."
+    })
 
-if not reco:
-    st.markdown("No prioritized Cloudflare recommendations — run advanced checks or autorize deeper scan.")
+if ports:
+    recs.append({
+        "issue": "Se detectan puertos expuestos accesibles desde Internet.",
+        "fix": "Cerrar servicios administrativos al público y exponerlos solo vía VPN o Zero Trust.",
+        "cloudflare": "Usar Cloudflare Tunnel + Access para publicar apps internas sin abrir puertos."
+    })
 
-st.markdown("---")
+if token_hints:
+    recs.append({
+        "issue": "Posibles tokens o claves visibles en frontend.",
+        "fix": "Rotar claves, mover secretos a backend y revisar pipelines de CI/CD.",
+        "cloudflare": "Usar Workers / Transform Rules para sanear respuestas y proteger APIs con API Shield."
+    })
 
-# ---------- Sales / outreach template ----------
-st.header("Suggested outreach email to CISO (short)")
-st.code(f"""Subject: CloudDefender quick scan results for {hostname}
+if subs and exposure_level in ("Medium","High"):
+    recs.append({
+        "issue": "Superficie digital amplia (muchos subdominios).",
+        "fix": "Inventariar dominios y subdominios; aplicar controles homogéneos.",
+        "cloudflare": "Centralizar DNS en Cloudflare y usar análisis de tráfico + reglas por hostname."
+    })
+
+if emails and exposure_level == "High":
+    recs.append({
+        "issue": "Muchos correos públicos en el sitio (phishing target).",
+        "fix": "Revisar qué correos deben ser públicos y usar formularios en vez de exponerlos en texto.",
+        "cloudflare": "Refuerza DMARC/DKIM/SPF y considera Email Security (según plan)."
+    })
+
+if not recs:
+    st.markdown("No se detectan recomendaciones críticas inmediatas. Aun así, se pueden revisar reglas avanzadas de WAF, Bot Management y Zero Trust.")
+else:
+    for r in recs:
+        st.markdown(f"**Issue:** {r['issue']}  \n- Fix sugerido: {r['fix']}  \n- *Cloudflare:* {r['cloudflare']}")
+        st.markdown("---")
+
+# ===================== OUTREACH TEMPLATE =====================
+
+st.header("Plantilla de correo para CISO/CTO (resumen)")
+
+email_template = f"""Subject: CloudDefender passive scan results for {hostname}
 
 Hi {{Name}},
 
-I ran a quick, non-intrusive scan of {hostname} (public surface). Key highlights:
-- Grade: {grade} ({score}%)
-- Missing security headers: {', '.join(missing_headers) if missing_headers else 'None'}
-- WAF/CDN: {', '.join(waf)}
-- Token leaks: {len(token_leaks)}
-- Public emails found: {len(harvested_emails)}
+We ran a quick, non-intrusive exposure assessment of {hostname} using only public information (no exploitation, no load).
 
-We can run an authorized deep assessment (includes safe API checks, token audits, and remediation plan). We also offer Cloudflare-based mitigations (WAF, Access, Tunnel, R2) and a 30-day remediation playbook.
+Key observations:
+- Exposure level: {exposure_level} (internal score: {exposure_score_raw})
+- Tech stack: {', '.join(stack) if stack else 'Unknown'}
+- Public subdomains detected: {len(subs)}
+- Open ports (quick handshake): {len(ports)}
+- Public emails on site: {len(emails)}
+- Token/API key hints in frontend: {len(token_hints)}
 
-If you want, I can schedule a 30-min walkthrough and share a tailored remediation estimate.
+We use these findings as a starting point for awareness and for designing a remediation plan based on Cloudflare’s security stack (WAF, Zero Trust, Bot Management, API protection).
 
-Regards,
-Your Team - CloudDefender
-""")
+If you’d like, we can schedule a short session to walk you through the results and outline a remediation roadmap tailored to your environment.
 
-st.caption("⚠️ Legal reminder: this tool runs **safe** public checks. For active testing (auth tests, fuzzing, load tests) get written authorization.")
+Best regards,
+CloudDefender Team
+"""
 
-# End
+st.code(email_template, language="text")
+
+st.caption("⚠️ Solo para uso ético y educativo. Para pruebas activas/pentesting, se requiere autorización formal y otro tipo de herramienta/laboratorio.")
