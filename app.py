@@ -630,7 +630,10 @@ st.header("Details by Module")
 
 if mod_dns:
     with st.expander("DNS & WHOIS"):
-        st.json({"dns": results.get("dns"), "whois": results.get("whois")})
+        st.subheader("DNS records")
+        st.json(results.get("dns"))
+        st.subheader("WHOIS")
+        st.json(results.get("whois"))
 
 if mod_http:
     with st.expander("HTTP & Security headers"):
@@ -642,11 +645,20 @@ if mod_tls:
 
 if mod_ips_ports:
     with st.expander("IPs & Quick Port Handshake"):
-        st.json({"ips": results.get("ips"), "ports_open": results.get("ports")})
+        st.subheader("IPs detectados")
+        st.write(results.get("ips") or [])
+        st.subheader("Puertos abiertos (quick handshake)")
+        ports_list = results.get("ports") or []
+        st.write(f"Total: {len(ports_list)}")
+        if ports_list:
+            st.table(ports_list)
 
 if mod_subdomains:
     with st.expander("Subdomains (crt.sh passive)"):
-        st.json(results.get("subdomains_crt"))
+        subs = results.get("subdomains_crt") or []
+        st.write(f"Total encontrados: {len(subs)}")
+        if subs:
+            st.write(subs)
 
 if mod_tech_basic:
     with st.expander("Tech stack & Traffic estimate (basic)"):
@@ -654,10 +666,18 @@ if mod_tech_basic:
 
 if mod_emails:
     with st.expander("Emails & token hints"):
-        st.json({
-            "emails_public": results.get("emails"),
-            "token_hints": results.get("token_hints")
-        })
+        emails_list = results.get("emails") or []
+        token_list = results.get("token_hints") or []
+
+        st.subheader("Emails públicos detectados")
+        st.write(f"Total: {len(emails_list)}")
+        if emails_list:
+            st.write(emails_list)
+
+        st.subheader("Token/API key hints en frontend")
+        st.write(f"Total: {len(token_list)}")
+        if token_list:
+            st.write(token_list)
 
 if mod_asn:
     with st.expander("ASN & GeoIP"):
@@ -673,15 +693,32 @@ if mod_adv_subs:
 
 if mod_api_exp:
     with st.expander("API exposure (/api/*)"):
-        st.json(results.get("api_exposure"))
+        api_list = results.get("api_exposure") or []
+        st.write(f"Total endpoints detectados: {len(api_list)}")
+        if api_list:
+            st.table(api_list)
 
 if mod_buckets:
     with st.expander("Cloud storage buckets referenced in HTML/JS"):
-        st.json(results.get("buckets"))
+        buckets_info = results.get("buckets") or {}
+        found = buckets_info.get("found") or []
+        status_list = buckets_info.get("status") or []
+
+        st.subheader("Buckets encontrados en HTML/JS")
+        st.write(f"Total: {len(found)}")
+        if found:
+            st.write(found)
+
+        st.subheader("Respuesta de los buckets (status)")
+        if status_list:
+            st.table(status_list)
 
 if mod_wp_plugins:
     with st.expander("WordPress plugins (from HTML)"):
-        st.json(results.get("wp_plugins"))
+        plugins = results.get("wp_plugins") or []
+        st.write(f"Total plugins detectados: {len(plugins)}")
+        if plugins:
+            st.write(plugins)
 
 if mod_ecommerce:
     with st.expander("E-commerce hints (Shopify/Woo/Magento + routes)"):
@@ -694,6 +731,10 @@ if mod_wappa:
 if mod_exposure:
     with st.expander("Exposure Score (internal)"):
         st.json(results.get("exposure"))
+
+# Extra: raw results para debugging / geek mode
+with st.expander("Raw results (JSON completo)"):
+    st.json(results)
 
 # ===================== CLOUDFLARE RECOMMENDATIONS =====================
 
@@ -792,4 +833,4 @@ CloudDefender Team
 
 st.code(email_template, language="text")
 
-st.caption("⚠️ Solo para uso ético y educativo. Para pruebas activas/pentesting, se requiere autorización formal y herramientas específicas de laboratorio.")
+st.caption("⚠️ Solo para uso ético y educativo")
